@@ -85,8 +85,15 @@ class HuggingFaceBackend:
         self._adapter_record = None
         if config.adapter_path:
             record = json.loads((Path(config.adapter_path).parent / "run_config.json").read_text(encoding="utf-8"))
-            if record.get("schema_version") != "lora-sft-run-v1":
+            if record.get("schema_version") not in {"lora-sft-run-v1","lora-grpo-run-v1"}:
                 raise ValueError("Adapter requires training run provenance")
+            if record["schema_version"] == "lora-grpo-run-v1":
+                from grpo.policy import adapter_hash
+                source = record.get("initial_sft_adapter_sha256")
+                if (record.get("status") != "complete" or not isinstance(source,str)
+                    or len(source) != 64 or any(c not in "0123456789abcdef" for c in source)
+                    or record.get("adapter_sha256") != adapter_hash(Path(config.adapter_path))):
+                    raise ValueError("GRPO adapter checkpoint identity/status mismatch")
             self._adapter_record = record
             identity = record["identity"]
             if (config.model_name_or_path != identity["base_model_name_or_path"]
@@ -135,6 +142,13 @@ class HuggingFaceBackend:
                 raise ValueError("PEFT adapter target modules mismatch")
             self._model = PeftModel.from_pretrained(self._model, config.adapter_path, is_trainable=False,
                                                      local_files_only=True)
+            if self._adapter_record["schema_version"] == "lora-grpo-run-v1":
+                # PEFT may initialize a first adapter in the BF16 base dtype and
+                # only then promote LoRA to FP32. Reload into those FP32 tensors
+                # so an RL checkpoint is evaluated with its exact trained values.
+                from peft.utils.save_and_load import load_peft_weights,set_peft_model_state_dict
+                state = load_peft_weights(config.adapter_path,device="cpu",local_files_only=True)
+                set_peft_model_state_dict(self._model,state,adapter_name="default")
         self._model.to(config.device)
         self._model.eval()
         if getattr(self._model.config, "is_encoder_decoder", False):
@@ -190,7 +204,7 @@ class HuggingFaceBackend:
                 raise ValueError("Unsupported message role")
         return converted
 
-    def generate(self, messages: list[Message]) -> str:
+    def _prepare_inputs(self, messages: list[Message]) -> tuple[Any, int, list[Message]]:
         converted = self._copy_messages(messages)
         if self._template is not None:
             prompt = self._tokenizer.apply_chat_template(
@@ -208,6 +222,10 @@ class HuggingFaceBackend:
         known_limits = [limit for limit in limits if type(limit) is int and 0 < limit < 10**9]
         if known_limits and input_length + self.config.max_new_tokens > min(known_limits):
             raise ValueError("Prompt plus generation budget exceeds model context; no silent truncation")
+        return inputs,input_length,converted
+
+    def generate(self, messages: list[Message]) -> str:
+        inputs,input_length,_ = self._prepare_inputs(messages)
         with self._torch.inference_mode():
             outputs = self._model.generate(
                 input_ids=inputs["input_ids"].to(self.config.device),
@@ -220,6 +238,34 @@ class HuggingFaceBackend:
         return self._tokenizer.decode(
             continuation, skip_special_tokens=True, clean_up_tokenization_spaces=False,
         )
+
+    def generate_with_trace(self, messages: list[Message]) -> dict[str, Any]:
+        """RL-only stochastic generation. Baseline generate and its defaults stay intact."""
+        if not self.config.do_sample or self.config.top_p != 1 or self._template is None:
+            raise ValueError("Traced RL generation requires sampling, top_p=1 and model-owned template")
+        inputs,length,converted = self._prepare_inputs(messages)
+        kwargs = dict(self._generation_kwargs, top_k=0, use_cache=True,
+                      return_dict_in_generate=True, output_scores=True)
+        generation_config = self._transformers.GenerationConfig(**kwargs)
+        with self._torch.inference_mode():
+            output = self._model.generate(
+                input_ids=inputs["input_ids"].to(self.config.device),
+                attention_mask=inputs["attention_mask"].to(self.config.device),
+                generation_config=generation_config, **kwargs)
+            ids = output.sequences[0,length:].tolist()
+            if len(ids) != len(output.scores) or not ids:
+                raise ValueError("Generated IDs/scores length mismatch")
+            # Scores are the actual processed sampling logits, including temperature.
+            logprobs = self._torch.stack([
+                scores[0,token].float() - self._torch.logsumexp(scores[0].float(),dim=-1)
+                for scores,token in zip(output.scores,ids,strict=True)]).cpu().tolist()
+        eos = kwargs["eos_token_id"]
+        eos_ids = list(eos) if isinstance(eos,(list,tuple)) else [eos]
+        raw = self._tokenizer.decode(ids,skip_special_tokens=True,clean_up_tokenization_spaces=False)
+        return {"messages":converted,"prompt_ids":inputs["input_ids"][0].tolist(),
+                "generated_ids":ids,"old_logprobs":logprobs,"raw_output":raw,
+                "ended_with_eos":ids[-1] in eos_ids,
+                "token_limit":len(ids) == self.config.max_new_tokens and ids[-1] not in eos_ids}
 
     def runtime_config(self) -> dict[str, Any]:
         """Best-effort audit information, never claimed resolved when unavailable."""
@@ -241,8 +287,16 @@ class HuggingFaceBackend:
             "model_identity": self.model_identity(),
             "adapter_path": self.config.adapter_path,
             "adapter_identity_validated": self._adapter_record is not None,
+            "adapter_schema": self._adapter_record.get("schema_version") if self._adapter_record else None,
+            "adapter_sha256": self._adapter_hash() if self._adapter_record else None,
+            "initial_sft_adapter_sha256": self._adapter_record.get("initial_sft_adapter_sha256") if self._adapter_record else None,
+            "adapter_precision_strategy": "exact_checkpoint_fp32_lora" if self._adapter_record and self._adapter_record["schema_version"] == "lora-grpo-run-v1" else "existing_hf_sft_loading",
             "adapter_training_dataset": self._adapter_record.get("dataset") if self._adapter_record else None,
         }
+
+    def _adapter_hash(self) -> str:
+        from grpo.policy import adapter_hash
+        return adapter_hash(Path(self.config.adapter_path))
 
     def model_identity(self) -> dict[str, Any]:
         from sft.preprocessing import tokenizer_fingerprint

@@ -162,7 +162,7 @@ def load_manifest_benchmark(path: Path, split: str = "test") -> tuple[list[Task]
         raise ValueError("Manifest benchmark split must be dev or test")
     content = path.read_bytes()
     manifest = json.loads(content)
-    if manifest.get("schema_version") != "sft-manifest-v1":
+    if manifest.get("schema_version") not in {"sft-manifest-v1","grpo-task-manifest-v1"}:
         raise ValueError("Unsupported benchmark manifest")
     coordinates = manifest["splits"][split]["coordinates"]
     if not isinstance(coordinates, list) or not coordinates:
@@ -186,12 +186,23 @@ def load_manifest_benchmark(path: Path, split: str = "test") -> tuple[list[Task]
                           "benchmark_manifest_sha256":hashlib.sha256(content).hexdigest()}
 
 
-def validate_comparison(base: dict[str, Any], adapted: dict[str, Any]) -> None:
+def validate_comparison(base: dict[str, Any], adapted: dict[str, Any], kind: str = "base-vs-sft") -> None:
     from sft.training import validate_adapter_identity
 
+    if kind not in {"base-vs-sft","sft-vs-grpo"}:
+        raise ValueError("Unsupported comparison kind")
     if (base.get("mode") != "hf_benchmark" or adapted.get("mode") != "hf_benchmark"
-        or base.get("adapter_path") is not None or adapted.get("adapter_identity_validated") is not True):
+        or adapted.get("adapter_identity_validated") is not True
+        or (kind == "base-vs-sft" and base.get("adapter_path") is not None)):
         raise ValueError("Comparison requires a real base benchmark and a provenance-validated adapter benchmark")
+    if kind == "sft-vs-grpo":
+        if (base.get("adapter_identity_validated") is not True or base.get("adapter_schema") != "lora-sft-run-v1"
+            or adapted.get("adapter_schema") != "lora-grpo-run-v1"
+            or not base.get("adapter_sha256")
+            or base["adapter_sha256"] != adapted.get("initial_sft_adapter_sha256")):
+            raise ValueError("SFT/GRPO comparison requires matching, audited SFT starting adapter")
+    elif adapted.get("adapter_schema") not in {None,"lora-sft-run-v1"}:
+        raise ValueError("Use sft-vs-grpo for a GRPO adapter comparison")
     validate_adapter_identity(base["model_identity"], adapted["model_identity"])
     for key in ("task_ids", "environment_seeds", "max_steps", "generation_seed", "generation_arguments",
                 "dtype", "chat_template_strategy", "tool_message_strategy", "transformers_version", "torch_version"):
@@ -204,9 +215,10 @@ def validate_comparison(base: dict[str, Any], adapted: dict[str, Any]) -> None:
         raise ValueError("Base/SFT benchmark coordinates mismatch")
 
 
-def comparison_metrics(base: dict[str, Any], adapted: dict[str, Any]) -> dict[str, Any]:
+def comparison_metrics(base: dict[str, Any], adapted: dict[str, Any], kind: str = "base-vs-sft") -> dict[str, Any]:
     keys = ("task_success_rate", "invalid_tool_call_rate", "average_tool_calls", "average_agent_steps")
-    return {"base":base, "sft":adapted,
+    names = ("sft","grpo") if kind == "sft-vs-grpo" else ("base","sft")
+    return {names[0]:base, names[1]:adapted,
             "delta":{key:adapted[key]["value"] - base[key]["value"]
                      if adapted[key]["value"] is not None and base[key]["value"] is not None else None for key in keys},
             "parse_error_count_delta":adapted["counts"]["parse_error_count"] - base["counts"]["parse_error_count"],
@@ -227,6 +239,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--adapter-path", help="Saved adapter directory; requires exact training model revision")
     parser.add_argument("--tokenizer-path", help="Optional saved training tokenizer directory")
     parser.add_argument("--compare-to", type=Path, help="Base HF result directory; refuse incompatible configurations")
+    parser.add_argument("--comparison-kind",choices=("base-vs-sft","sft-vs-grpo"),default="base-vs-sft")
     parser.add_argument("--cache-dir")
     parser.add_argument("--dtype", choices=("float32", "bfloat16", "float16"), default="float32")
     parser.add_argument("--max-steps", type=int, default=16)
@@ -309,7 +322,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             if arguments.output_dir is None:
                 raise ValueError("Comparison requires --output-dir")
             base_config = json.loads((arguments.compare_to / "run_config.json").read_text(encoding="utf-8"))
-            validate_comparison(base_config, configuration)  # BEFORE any task runs.
+            validate_comparison(base_config, configuration,arguments.comparison_kind)  # BEFORE any task runs.
             base_metrics = json.loads((arguments.compare_to / "metrics.json").read_text(encoding="utf-8"))
         report = evaluate_tasks(
             tasks, agent_factory, environment_seeds,
@@ -318,7 +331,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             save_report(arguments.output_dir, report, configuration)
             if arguments.compare_to:
                 with (arguments.output_dir / "comparison.json").open("x", encoding="utf-8") as stream:
-                    json.dump(comparison_metrics(base_metrics, report.metrics), stream, indent=2, sort_keys=True, allow_nan=False)
+                    json.dump(comparison_metrics(base_metrics, report.metrics,arguments.comparison_kind), stream, indent=2, sort_keys=True, allow_nan=False)
     except (OSError, ValueError, RuntimeError, KeyError, TypeError) as exc:
         parser.error(str(exc))
     output = {

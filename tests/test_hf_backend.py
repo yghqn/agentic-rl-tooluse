@@ -385,7 +385,63 @@ def prepare_adapter(fake_hf, tmp_path, monkeypatch):
     monkeypatch.setitem(sys.modules, "peft", SimpleNamespace(
         PeftConfig=SimpleNamespace(from_pretrained=lambda *a, **k:peft_config),
         PeftModel=SimpleNamespace(from_pretrained=load)))
-    return directory / "adapter", peft_config
+    adapter = directory / "adapter"
+    adapter.mkdir()
+    (adapter / "adapter_config.json").write_text("{}")
+    (adapter / "adapter_model.safetensors").write_bytes(b"fake weights; no model download")
+    return adapter, peft_config
+
+
+def prepare_grpo_adapter(fake_hf,tmp_path,monkeypatch):
+    from grpo.policy import adapter_hash
+    adapter,_ = prepare_adapter(fake_hf,tmp_path,monkeypatch)
+    path = adapter.parent/"run_config.json"
+    record = json.loads(path.read_text())
+    record.update(schema_version="lora-grpo-run-v1",status="complete",
+                  initial_sft_adapter_sha256="a"*64,adapter_sha256=adapter_hash(adapter))
+    path.write_text(json.dumps(record))
+    reloads = []
+    monkeypatch.setitem(sys.modules,"peft.utils.save_and_load",SimpleNamespace(
+        load_peft_weights=lambda *a,**k:{"fake":"weights"},
+        set_peft_model_state_dict=lambda *a,**k:reloads.append((a,k))))
+    return adapter,record,reloads
+
+
+def test_grpo_adapter_validated_and_exact_weights_reloaded(fake_hf,tmp_path,monkeypatch):
+    adapter,record,reloads = prepare_grpo_adapter(fake_hf,tmp_path,monkeypatch)
+    backend = make_backend(adapter_path=str(adapter),revision="model-commit")
+    runtime = backend.runtime_config()
+    assert runtime["adapter_schema"] == "lora-grpo-run-v1"
+    assert runtime["initial_sft_adapter_sha256"] == "a"*64
+    assert len(reloads) == 1 and reloads[0][1] == {"adapter_name":"default"}
+
+
+@pytest.mark.parametrize("mutation",["status","adapter_hash","source_hash","revision","template"])
+def test_grpo_adapter_tampering_rejected(fake_hf,tmp_path,monkeypatch,mutation):
+    adapter,record,_ = prepare_grpo_adapter(fake_hf,tmp_path,monkeypatch)
+    if mutation == "status": record["status"] = "incomplete"
+    elif mutation == "adapter_hash": record["adapter_sha256"] = "0"*64
+    elif mutation == "source_hash": record["initial_sft_adapter_sha256"] = "invalid"
+    elif mutation == "revision": record["identity"]["base_model_revision"] = "wrong"
+    else: record["identity"]["chat_template_sha256"] = "wrong"
+    (adapter.parent/"run_config.json").write_text(json.dumps(record))
+    with pytest.raises(ValueError):
+        make_backend(adapter_path=str(adapter),revision="model-commit")
+
+
+def test_sft_grpo_comparison_requires_audited_start_and_equal_identity():
+    common = {"mode":"hf_benchmark","adapter_identity_validated":True,"adapter_path":"adapter",
+        "model_identity":{"base_model_name_or_path":"model","base_model_revision":"r",
+            "tokenizer_identity":"model","tokenizer_revision":"r","chat_template_sha256":"t","tokenizer_sha256":"v"},
+        "task_ids":["task"],"environment_seeds":{"env":1},"max_steps":16,"generation_seed":42,
+        "generation_arguments":{"do_sample":False},"dtype":"bf16","chat_template_strategy":"model_chat_template",
+        "tool_message_strategy":"user_observation_with_tool_name","transformers_version":"4","torch_version":"2",
+        "requested_backend_config":{"device":"cuda:0"},"benchmark_coordinates":[{"seed":1}]}
+    sft = dict(common,adapter_schema="lora-sft-run-v1",adapter_sha256="a"*64)
+    rl = dict(common,adapter_schema="lora-grpo-run-v1",initial_sft_adapter_sha256="a"*64)
+    validate_comparison(sft,rl,"sft-vs-grpo")
+    for key,value in (("initial_sft_adapter_sha256","wrong"),("task_ids",["test-task"]),("generation_arguments",{"do_sample":True})):
+        with pytest.raises(ValueError): validate_comparison(sft,dict(rl,**{key:value}),"sft-vs-grpo")
 
 
 def test_adapter_loading_is_frozen_and_provenance_checked(fake_hf, tmp_path, monkeypatch):
