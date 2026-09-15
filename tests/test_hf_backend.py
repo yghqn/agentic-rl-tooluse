@@ -5,12 +5,15 @@ from copy import deepcopy
 import json
 from types import ModuleType, SimpleNamespace
 import sys
+from pathlib import Path
 
 import pytest
 
 from agent.agent import PromptAgent
 from agent.hf_backend import HuggingFaceBackend, HuggingFaceConfig
-from scripts.evaluate import main, evaluate_tasks
+from scripts.evaluate import main, evaluate_tasks, load_manifest_benchmark, validate_comparison
+from sft.dataset import DatasetConfig, build_dataset, export_dataset
+from sft.training import TrainingConfig, lora_configuration
 from tasks.generator import TaskGenerator
 from tasks.validators import environment_id_for_seed
 
@@ -112,9 +115,14 @@ def fake_hf(monkeypatch):
     transformers.GenerationConfig = GenerationConfig
     transformers.set_seed = state.seeds.append
     transformers.AutoTokenizer = SimpleNamespace(from_pretrained=lambda name, **kw: load("tokenizer", Tokenizer(), name, **kw))
+    transformers.AutoConfig = SimpleNamespace(from_pretrained=lambda *args, **kwargs: model.config)
     transformers.AutoModelForCausalLM = SimpleNamespace(from_pretrained=lambda name, **kw: load("model", model, name, **kw))
+    hub = ModuleType("transformers.utils.hub")
+    hub.cached_file = lambda *args, **kwargs: "fixture/tokenizer_config.json"
+    hub.extract_commit_hash = lambda *args: tokenizer.init_kwargs["_commit_hash"]
     monkeypatch.setitem(sys.modules, "torch", torch)
     monkeypatch.setitem(sys.modules, "transformers", transformers)
+    monkeypatch.setitem(sys.modules, "transformers.utils.hub", hub)
     return state
 
 
@@ -131,6 +139,7 @@ def test_greedy_loading_tokens_and_raw_continuation(fake_hf):
     assert fake_hf.loads[1][2] == {
         "revision": "pinned", "local_files_only": True, "trust_remote_code": False,
         "dtype": "torch.float32", "use_safetensors": True,
+        "config": fake_hf.model.config,
     }
     assert fake_hf.model.eval_count == 1 and fake_hf.inference == 2
     assert fake_hf.model_device == "cuda:0"
@@ -346,3 +355,144 @@ def test_cli_required_arguments(fake_hf, args):
     with pytest.raises(SystemExit):
         main(args)
     assert not fake_hf.loads
+
+
+def prepare_adapter(fake_hf, tmp_path, monkeypatch):
+    fake_hf.tokenizer.is_fast = True
+    fake_hf.tokenizer.backend_tokenizer = SimpleNamespace(to_str=lambda:'{"fixture":true}')
+    fake_hf.tokenizer.special_tokens_map = {"eos_token":"fixture-eos"}
+    fake_hf.tokenizer.init_kwargs["_commit_hash"] = "model-commit"
+    from sft.preprocessing import tokenizer_fingerprint
+    import hashlib
+
+    identity = {"base_model_name_or_path":"fake/model", "base_model_revision":"model-commit",
+                "tokenizer_identity":"fake/model", "tokenizer_revision":"model-commit",
+                "chat_template_sha256":hashlib.sha256(b"own-template").hexdigest(),
+                "tokenizer_sha256":tokenizer_fingerprint(fake_hf.tokenizer)}
+    lora = lora_configuration(TrainingConfig("data", "out"))
+    directory = tmp_path / "training"
+    directory.mkdir()
+    record = {"schema_version":"lora-sft-run-v1", "identity":identity, "lora":lora,
+              "dataset":{"manifest_sha256":"fixture"}}
+    (directory / "run_config.json").write_text(json.dumps(record))
+    peft_config = SimpleNamespace(base_model_name_or_path="fake/model", revision="model-commit", peft_type="LORA", **lora)
+    fake_hf.adapter_loads = []
+
+    def load(model, path, **kw):
+        fake_hf.adapter_loads.append((model,path,kw))
+        return model
+
+    monkeypatch.setitem(sys.modules, "peft", SimpleNamespace(
+        PeftConfig=SimpleNamespace(from_pretrained=lambda *a, **k:peft_config),
+        PeftModel=SimpleNamespace(from_pretrained=load)))
+    return directory / "adapter", peft_config
+
+
+def test_adapter_loading_is_frozen_and_provenance_checked(fake_hf, tmp_path, monkeypatch):
+    adapter, _ = prepare_adapter(fake_hf, tmp_path, monkeypatch)
+    backend = make_backend(adapter_path=str(adapter), revision="model-commit", tokenizer_path=str(adapter.parent / "tokenizer"))
+    assert backend.runtime_config()["adapter_identity_validated"] is True
+    assert fake_hf.adapter_loads[0][2] == {"is_trainable":False,"local_files_only":True}
+    assert backend.generate([{"role":"user","content":"normal task"}]) == fake_hf.output
+    assert "temperature" not in fake_hf.generated[0]
+
+
+@pytest.mark.parametrize("mutation", ["requested_revision", "model_revision", "tokenizer_revision", "template", "tokenizer", "lora"])
+def test_adapter_mismatches_are_rejected(fake_hf, tmp_path, monkeypatch, mutation):
+    adapter, peft_config = prepare_adapter(fake_hf, tmp_path, monkeypatch)
+    revision = "model-commit"
+    if mutation == "requested_revision":
+        revision = "main"
+    elif mutation == "model_revision":
+        fake_hf.model.config._commit_hash = "wrong"
+    elif mutation == "tokenizer_revision":
+        fake_hf.tokenizer.init_kwargs["_commit_hash"] = "wrong"
+    elif mutation == "template":
+        fake_hf.tokenizer.chat_template = "different-template"
+    elif mutation == "tokenizer":
+        fake_hf.tokenizer.special_tokens_map = {}
+    else:
+        peft_config.r = 64
+    with pytest.raises(ValueError):
+        make_backend(adapter_path=str(adapter), revision=revision)
+    assert not fake_hf.adapter_loads
+
+
+@pytest.mark.parametrize("kwargs", [{"dtype":"int8"}, {"adapter_path":""}, {"tokenizer_path":"tok"},
+                                    {"adapter_path":"adapter","allow_fallback_template":True}])
+def test_invalid_adapter_configuration(kwargs):
+    with pytest.raises(ValueError):
+        HuggingFaceConfig("fake/model", **kwargs)
+
+
+def test_manifest_benchmark_reads_coordinates_only(fake_hf, tmp_path, monkeypatch):
+    directory = tmp_path / "dataset"
+    export_dataset(build_dataset(DatasetConfig(train_size=16,dev_size=16,test_size=16)), directory)
+    manifest_path = directory / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["splits"]["test"]["coordinates"][0]["messages"] = "FORBIDDEN_ORACLE_OUTPUT"
+    manifest_path.write_text(json.dumps(manifest))
+    # Delete every sample/trajectory export. Coordinates alone are sufficient.
+    for path in directory.glob("*.jsonl"):
+        path.unlink()
+    original = Path.read_bytes
+
+    def guarded(path):
+        assert not path.name.endswith(".jsonl")
+        return original(path)
+
+    monkeypatch.setattr(Path, "read_bytes", guarded)
+    tasks, seeds, configuration = load_manifest_benchmark(manifest_path)
+    assert len(tasks) == 16 and list(seeds.values()) == [30000]
+    assert all(set(c) == {"seed","difficulty","task_index","task_id"} for c in configuration["benchmark_coordinates"])
+    report = evaluate_tasks(tasks, lambda _:PromptAgent(make_backend(), max_steps=1), seeds)
+    assert len(report.records) == 16
+    rendered = json.dumps(fake_hf.rendered)
+    assert "FORBIDDEN_ORACLE_OUTPUT" not in rendered
+    for forbidden in ("ground_truth", "verification_spec", "metadata", "coordinates"):
+        assert forbidden not in rendered
+    assert all(len(messages) == 2 for messages, _ in fake_hf.rendered)
+
+
+def test_manifest_identity_mismatch_rejected(tmp_path):
+    path = tmp_path / "manifest.json"
+    path.write_text(json.dumps({"schema_version":"sft-manifest-v1", "splits":{"test":{"coordinates":[
+        {"seed":42,"difficulty":1,"task_index":0,"task_id":"wrong"}]}}}))
+    with pytest.raises(ValueError, match="identity"):
+        load_manifest_benchmark(path)
+
+
+def test_cli_base_adapter_comparison_and_real_parse_errors(fake_hf, tmp_path, monkeypatch, capsys):
+    adapter, _ = prepare_adapter(fake_hf, tmp_path, monkeypatch)
+    fake_hf.output = '```json\n{"type":"final","answer":0}\n```'
+    base, sft = tmp_path / "base", tmp_path / "sft"
+    common = ["--backend","hf","--model","fake/model","--revision","model-commit", "--count-per-level","1","--max-steps","1"]
+    assert main(common + ["--output-dir",str(base)]) == 0
+    capsys.readouterr()
+    assert main(common + ["--output-dir",str(sft),"--adapter-path",str(adapter),"--compare-to",str(base)]) == 0
+    capsys.readouterr()
+    result = json.loads((sft / "comparison.json").read_text())
+    assert result["base"]["counts"]["parse_error_count"] == 4
+    assert result["sft"]["counts"]["parse_error_count"] == 4
+    assert result["parse_error_count_delta"] == 0
+    base_config = json.loads((base / "run_config.json").read_text())
+    sft_config = json.loads((sft / "run_config.json").read_text())
+    sft_config["model_identity"]["chat_template_sha256"] = "wrong"
+    with pytest.raises(ValueError, match="chat_template_sha256"):
+        validate_comparison(base_config,sft_config)
+
+
+def test_cli_manifest_benchmark(fake_hf, tmp_path, capsys):
+    manifest = tmp_path / "manifest.json"
+    task = TaskGenerator(30000).generate_task(2,1)
+    manifest.write_text(json.dumps({"schema_version":"sft-manifest-v1", "splits":{"test":{"coordinates":[
+        {"seed":30000,"difficulty":2,"task_index":1,"task_id":task.task_id}]}}}))
+    directory = tmp_path / "eval"
+    assert main(["--backend","hf","--model","fake/model","--benchmark-manifest",str(manifest),
+                 "--output-dir",str(directory),"--max-steps","1"]) == 0
+    capsys.readouterr()
+    record = json.loads((directory / "run_config.json").read_text())
+    assert record["generation_seed"] == 42 and record["seed"] is None
+    assert record["environment_seeds"] == {task.environment_id:30000}
+    with pytest.raises(SystemExit):
+        main(["--benchmark-manifest",str(manifest),"--seed","42"])

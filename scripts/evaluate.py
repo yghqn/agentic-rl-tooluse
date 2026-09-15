@@ -11,6 +11,7 @@ import argparse
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 import json
+import hashlib
 from pathlib import Path
 import sys
 import subprocess
@@ -30,7 +31,7 @@ from tasks.schemas import Task
 from tasks.validators import environment_id_for_seed, validate_task
 
 
-RESULT_FILES = ("trajectories.jsonl", "metrics.json", "run_config.json")
+RESULT_FILES = ("trajectories.jsonl", "metrics.json", "run_config.json", "comparison.json")
 
 
 def check_output_directory(path: Path) -> None:
@@ -155,11 +156,79 @@ def load_scripted_responses(path: Path) -> dict[str, list[str]]:
     return scripts
 
 
+def load_manifest_benchmark(path: Path, split: str = "test") -> tuple[list[Task], dict[str, int], dict[str, Any]]:
+    """Read coordinate identity ONLY. Never open sibling SFT/oracle exports."""
+    if split not in {"dev", "test"}:
+        raise ValueError("Manifest benchmark split must be dev or test")
+    content = path.read_bytes()
+    manifest = json.loads(content)
+    if manifest.get("schema_version") != "sft-manifest-v1":
+        raise ValueError("Unsupported benchmark manifest")
+    coordinates = manifest["splits"][split]["coordinates"]
+    if not isinstance(coordinates, list) or not coordinates:
+        raise ValueError("Empty benchmark coordinates")
+    tasks, seeds, identities = [], {}, []
+    seen = set()
+    for row in coordinates:
+        # Whitelist: even if a manifest has extra privileged fields, they are ignored.
+        coordinate = {key:row[key] for key in ("seed", "difficulty", "task_index", "task_id")}
+        if (any(type(coordinate[key]) is not int for key in ("seed", "difficulty", "task_index"))
+            or coordinate["difficulty"] not in {1,2,3,4} or coordinate["task_index"] < 0):
+            raise ValueError("Invalid benchmark coordinate")
+        task = TaskGenerator(coordinate["seed"]).generate_task(coordinate["difficulty"], coordinate["task_index"])
+        if task.task_id != coordinate["task_id"] or task.task_id in seen:
+            raise ValueError("Benchmark task identity mismatch/duplicate")
+        seen.add(task.task_id)
+        tasks.append(task)
+        seeds[task.environment_id] = coordinate["seed"]
+        identities.append(coordinate)
+    return tasks, seeds, {"benchmark_split":split, "benchmark_coordinates":identities,
+                          "benchmark_manifest_sha256":hashlib.sha256(content).hexdigest()}
+
+
+def validate_comparison(base: dict[str, Any], adapted: dict[str, Any]) -> None:
+    from sft.training import validate_adapter_identity
+
+    if (base.get("mode") != "hf_benchmark" or adapted.get("mode") != "hf_benchmark"
+        or base.get("adapter_path") is not None or adapted.get("adapter_identity_validated") is not True):
+        raise ValueError("Comparison requires a real base benchmark and a provenance-validated adapter benchmark")
+    validate_adapter_identity(base["model_identity"], adapted["model_identity"])
+    for key in ("task_ids", "environment_seeds", "max_steps", "generation_seed", "generation_arguments",
+                "dtype", "chat_template_strategy", "tool_message_strategy", "transformers_version", "torch_version"):
+        if key not in base or base[key] != adapted.get(key):
+            raise ValueError(f"Base/SFT comparison configuration mismatch: {key}")
+    if base["requested_backend_config"]["device"] != adapted["requested_backend_config"]["device"]:
+        raise ValueError("Base/SFT comparison device mismatch")
+    # Dataset identities are immutable; paths are not needed to compare benchmark semantics.
+    if base.get("benchmark_coordinates") != adapted.get("benchmark_coordinates"):
+        raise ValueError("Base/SFT benchmark coordinates mismatch")
+
+
+def comparison_metrics(base: dict[str, Any], adapted: dict[str, Any]) -> dict[str, Any]:
+    keys = ("task_success_rate", "invalid_tool_call_rate", "average_tool_calls", "average_agent_steps")
+    return {"base":base, "sft":adapted,
+            "delta":{key:adapted[key]["value"] - base[key]["value"]
+                     if adapted[key]["value"] is not None and base[key]["value"] is not None else None for key in keys},
+            "parse_error_count_delta":adapted["counts"]["parse_error_count"] - base["counts"]["parse_error_count"],
+            "success_by_difficulty_delta":{
+                level:adapted["by_difficulty"][level]["task_success_rate"]["value"] - values["task_success_rate"]["value"]
+                if values["task_success_rate"]["value"] is not None and adapted["by_difficulty"][level]["task_success_rate"]["value"] is not None
+                else None for level, values in base["by_difficulty"].items()}}
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Prompt Agent scripted replay or Hugging Face benchmark")
     parser.add_argument("--backend", choices=("scripted", "hf"), default="scripted")
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--count-per-level", type=int, default=2)
+    parser.add_argument("--seed", type=int)
+    parser.add_argument("--count-per-level", type=int)
+    parser.add_argument("--benchmark-manifest", type=Path)
+    parser.add_argument("--benchmark-split", choices=("dev", "test"), default="test")
+    parser.add_argument("--generation-seed", type=int, help="Defaults to benchmark seed, or 42 for manifests")
+    parser.add_argument("--adapter-path", help="Saved adapter directory; requires exact training model revision")
+    parser.add_argument("--tokenizer-path", help="Optional saved training tokenizer directory")
+    parser.add_argument("--compare-to", type=Path, help="Base HF result directory; refuse incompatible configurations")
+    parser.add_argument("--cache-dir")
+    parser.add_argument("--dtype", choices=("float32", "bfloat16", "float16"), default="float32")
     parser.add_argument("--max-steps", type=int, default=16)
     parser.add_argument("--responses", type=Path, help="Per-task JSONL model-output fixtures (scripted only)")
     parser.add_argument("--output-dir", type=Path, help="Save trajectories, metrics and run configuration")
@@ -178,7 +247,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise ValueError("max_steps must be positive")
         if arguments.output_dir is not None:
             check_output_directory(arguments.output_dir)
-        tasks = TaskGenerator(arguments.seed).generate_tasks(arguments.count_per_level)
+        benchmark = {}
+        if arguments.benchmark_manifest:
+            if arguments.seed is not None or arguments.count_per_level is not None:
+                raise ValueError("Manifest benchmark cannot be combined with --seed/--count-per-level")
+            tasks, environment_seeds, benchmark = load_manifest_benchmark(arguments.benchmark_manifest, arguments.benchmark_split)
+        else:
+            arguments.seed = 42 if arguments.seed is None else arguments.seed
+            arguments.count_per_level = 2 if arguments.count_per_level is None else arguments.count_per_level
+            tasks = TaskGenerator(arguments.seed).generate_tasks(arguments.count_per_level)
+            environment_seeds = {environment_id_for_seed(arguments.seed):arguments.seed}
         configuration = {
             "backend": arguments.backend,
             "seed": arguments.seed,
@@ -186,9 +264,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             "max_steps": arguments.max_steps,
             "order": "difficulty_then_task_id",
             "task_ids": [task.task_id for task in sorted(tasks, key=lambda item: (item.difficulty, item.task_id))],
+            "environment_seeds": environment_seeds,
+            **benchmark,
             **project_git_state(),
         }
         if arguments.backend == "scripted":
+            if arguments.adapter_path or arguments.tokenizer_path or arguments.compare_to:
+                raise ValueError("Adapter evaluation/comparison requires --backend hf")
             if arguments.responses is None or arguments.model is not None:
                 raise ValueError("scripted requires --responses and does not accept --model")
             scripts = load_scripted_responses(arguments.responses)
@@ -207,26 +289,37 @@ def main(argv: Sequence[str] | None = None) -> int:
                 top_p=arguments.top_p, do_sample=arguments.do_sample,
                 local_files_only=arguments.local_files_only,
                 allow_fallback_template=arguments.allow_fallback_template,
+                adapter_path=arguments.adapter_path, tokenizer_path=arguments.tokenizer_path,
+                dtype=arguments.dtype, cache_dir=arguments.cache_dir,
             )
             backend = HuggingFaceBackend(backend_config)
             # Seed sampling once for the whole deterministic task order. Greedy
             # remains the default; no per-task conversational state is shared.
             from transformers import set_seed
 
-            generation_seed = arguments.seed % (2**32)
+            generation_seed = (arguments.generation_seed if arguments.generation_seed is not None
+                               else (arguments.seed if arguments.seed is not None else 42)) % (2**32)
             set_seed(generation_seed)
             configuration["generation_seed"] = generation_seed
             configuration.update({"requested_backend_config": asdict(backend_config), **backend.runtime_config()})
             mode = "hf_debug_fallback" if backend.chat_template_strategy == "debug_plaintext_fallback" else "hf_benchmark"
             agent_factory = lambda task_id: PromptAgent(backend, arguments.max_steps)
         configuration["mode"] = mode
+        if arguments.compare_to:
+            if arguments.output_dir is None:
+                raise ValueError("Comparison requires --output-dir")
+            base_config = json.loads((arguments.compare_to / "run_config.json").read_text(encoding="utf-8"))
+            validate_comparison(base_config, configuration)  # BEFORE any task runs.
+            base_metrics = json.loads((arguments.compare_to / "metrics.json").read_text(encoding="utf-8"))
         report = evaluate_tasks(
-            tasks, agent_factory,
-            {environment_id_for_seed(arguments.seed): arguments.seed},
+            tasks, agent_factory, environment_seeds,
         )
         if arguments.output_dir is not None:
             save_report(arguments.output_dir, report, configuration)
-    except (OSError, ValueError, RuntimeError) as exc:
+            if arguments.compare_to:
+                with (arguments.output_dir / "comparison.json").open("x", encoding="utf-8") as stream:
+                    json.dump(comparison_metrics(base_metrics, report.metrics), stream, indent=2, sort_keys=True, allow_nan=False)
+    except (OSError, ValueError, RuntimeError, KeyError, TypeError) as exc:
         parser.error(str(exc))
     output = {
         "mode": mode,

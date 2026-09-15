@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import math
+import json
+from pathlib import Path
 from typing import Any
 
 from agent.prompts import Message
@@ -21,6 +23,10 @@ class HuggingFaceConfig:
     do_sample: bool = False
     local_files_only: bool = False
     allow_fallback_template: bool = False
+    cache_dir: str | None = None
+    dtype: str = "float32"
+    adapter_path: str | None = None
+    tokenizer_path: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.model_name_or_path, str) or not self.model_name_or_path.strip():
@@ -40,6 +46,16 @@ class HuggingFaceConfig:
                 raise ValueError(f"{name} must be positive and finite")
         if self.top_p > 1:
             raise ValueError("top_p must be <= 1")
+        if self.dtype not in {"float32", "bfloat16", "float16"}:
+            raise ValueError("Unsupported dtype")
+        for name in ("cache_dir", "adapter_path", "tokenizer_path"):
+            value = getattr(self, name)
+            if value is not None and (not isinstance(value, str) or not value.strip()):
+                raise ValueError(f"{name} must be non-empty when supplied")
+        if self.tokenizer_path and not self.adapter_path:
+            raise ValueError("tokenizer_path requires an adapter")
+        if self.adapter_path and self.allow_fallback_template:
+            raise ValueError("Adapter evaluation cannot use a fallback template")
 
 
 class HuggingFaceBackend:
@@ -64,7 +80,28 @@ class HuggingFaceBackend:
             "local_files_only": config.local_files_only,
             "trust_remote_code": False,
         }
-        self._tokenizer = transformers.AutoTokenizer.from_pretrained(config.model_name_or_path, **loading)
+        if config.cache_dir is not None:
+            loading["cache_dir"] = config.cache_dir
+        self._adapter_record = None
+        if config.adapter_path:
+            record = json.loads((Path(config.adapter_path).parent / "run_config.json").read_text(encoding="utf-8"))
+            if record.get("schema_version") != "lora-sft-run-v1":
+                raise ValueError("Adapter requires training run provenance")
+            self._adapter_record = record
+            identity = record["identity"]
+            if (config.model_name_or_path != identity["base_model_name_or_path"]
+                or config.revision != identity["base_model_revision"]):
+                raise ValueError("Adapter requires its exact training base model ID and pinned revision")
+        # Resolve tokenizer provenance and load its exact local snapshot. Some
+        # Transformers versions probe remote model metadata even with local_files_only.
+        from sft.training import tokenizer_source
+
+        tokenizer_loading = {k:v for k,v in loading.items() if k != "revision"}
+        if config.tokenizer_path:
+            source, self._tokenizer_revision = config.tokenizer_path, config.revision
+        else:
+            source, self._tokenizer_revision = tokenizer_source(config.model_name_or_path, config.revision, tokenizer_loading)
+        self._tokenizer = transformers.AutoTokenizer.from_pretrained(source, **tokenizer_loading)
         # Resolve the default template explicitly (including tokenizers with a
         # template dictionary); do not silently choose a tool-specific template.
         if getattr(self._tokenizer, "chat_template", None):
@@ -77,9 +114,27 @@ class HuggingFaceBackend:
             self.chat_template_strategy = "debug_plaintext_fallback"
         else:
             raise ValueError("Model tokenizer has no chat template; debug fallback requires explicit opt-in")
-        self._model = transformers.AutoModelForCausalLM.from_pretrained(
-            config.model_name_or_path, **loading, dtype=torch.float32, use_safetensors=True,
-        )
+        from sft.training import load_causal_model
+
+        self._model = load_causal_model(config.model_name_or_path, loading, getattr(torch, config.dtype))
+        if config.adapter_path:
+            from peft import PeftConfig, PeftModel
+            from sft.training import validate_adapter_identity
+
+            validate_adapter_identity(self._adapter_record["identity"], self.model_identity())
+            adapter_config = PeftConfig.from_pretrained(config.adapter_path, local_files_only=True)
+            if (adapter_config.base_model_name_or_path != config.model_name_or_path
+                or adapter_config.revision != config.revision or adapter_config.peft_type != "LORA"
+                or adapter_config.task_type != "CAUSAL_LM"):
+                raise ValueError("PEFT adapter configuration differs from training provenance")
+            expected_lora = self._adapter_record["lora"]
+            for key in ("r", "lora_alpha", "lora_dropout", "bias", "modules_to_save", "use_rslora"):
+                if getattr(adapter_config, key, None) != expected_lora[key]:
+                    raise ValueError(f"PEFT adapter configuration mismatch: {key}")
+            if set(adapter_config.target_modules) != set(expected_lora["target_modules"]):
+                raise ValueError("PEFT adapter target modules mismatch")
+            self._model = PeftModel.from_pretrained(self._model, config.adapter_path, is_trainable=False,
+                                                     local_files_only=True)
         self._model.to(config.device)
         self._model.eval()
         if getattr(self._model.config, "is_encoder_decoder", False):
@@ -171,7 +226,7 @@ class HuggingFaceBackend:
         return {
             "requested_model_revision": self.config.revision,
             "resolved_model_revision": getattr(self._model.config, "_commit_hash", None),
-            "resolved_tokenizer_revision": getattr(self._tokenizer, "init_kwargs", {}).get("_commit_hash"),
+            "resolved_tokenizer_revision": self._tokenizer_revision,
             "model_name": getattr(self._model.config, "_name_or_path", self.config.model_name_or_path),
             "tokenizer_name": self._tokenizer.name_or_path,
             "transformers_version": self._transformers.__version__,
@@ -183,4 +238,18 @@ class HuggingFaceBackend:
             "chat_template_strategy": self.chat_template_strategy,
             "chat_template_sha256": hashlib.sha256(self._template.encode()).hexdigest() if self._template else None,
             "tool_message_strategy": "user_observation_with_tool_name",
+            "model_identity": self.model_identity(),
+            "adapter_path": self.config.adapter_path,
+            "adapter_identity_validated": self._adapter_record is not None,
+            "adapter_training_dataset": self._adapter_record.get("dataset") if self._adapter_record else None,
         }
+
+    def model_identity(self) -> dict[str, Any]:
+        from sft.preprocessing import tokenizer_fingerprint
+
+        return {"base_model_name_or_path": self.config.model_name_or_path,
+                "base_model_revision": getattr(self._model.config, "_commit_hash", None),
+                "tokenizer_identity": self.config.model_name_or_path,
+                "tokenizer_revision": self._tokenizer_revision,
+                "chat_template_sha256": hashlib.sha256(self._template.encode()).hexdigest() if self._template else None,
+                "tokenizer_sha256": tokenizer_fingerprint(self._tokenizer) if getattr(self._tokenizer, "is_fast", False) else None}

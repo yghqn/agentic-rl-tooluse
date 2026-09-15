@@ -1,0 +1,4 @@
+# Optional LoRA SFT dependencies; base tests do not import or download models.
+-r requirements-hf.txt
+peft==0.17.1
+accelerate==1.10.1
