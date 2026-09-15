@@ -1,4 +1,4 @@
-"""Evaluation harness and offline replay CLI, with no training/model backend.
+"""Prompt Agent evaluation CLI: offline replay or optional HF inference, no training.
 
 Run: python -m scripts.evaluate --seed 42 --count-per-level 2 --responses replay.jsonl
 Each JSONL row: {"task_id": "...", "responses": ["<model output>", ...]}.
@@ -13,6 +13,7 @@ from dataclasses import asdict, dataclass
 import json
 from pathlib import Path
 import sys
+import subprocess
 from typing import Any
 
 if __package__ in (None, ""):
@@ -27,6 +28,44 @@ from evaluation.verifier import verify_final_answer
 from tasks.generator import TaskGenerator, agent_task_view
 from tasks.schemas import Task
 from tasks.validators import environment_id_for_seed, validate_task
+
+
+RESULT_FILES = ("trajectories.jsonl", "metrics.json", "run_config.json")
+
+
+def check_output_directory(path: Path) -> None:
+    if path.exists() and not path.is_dir():
+        raise ValueError("output-dir must be a directory")
+    if any((path / name).exists() for name in RESULT_FILES):
+        raise ValueError("Result files already exist; choose a new output-dir")
+
+
+def project_git_state() -> dict[str, Any]:
+    root = Path(__file__).resolve().parents[1]
+    try:
+        commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=root, capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        dirty = bool(subprocess.run(
+            ["git", "status", "--porcelain"], cwd=root, capture_output=True, text=True, check=True,
+        ).stdout.strip())
+        return {"git_commit_hash": commit, "git_dirty": dirty}
+    except (OSError, subprocess.CalledProcessError):
+        return {"git_commit_hash": None, "git_dirty": None}
+
+
+def save_report(path: Path, report: EvaluationReport, config: dict[str, Any]) -> None:
+    check_output_directory(path)
+    path.mkdir(parents=True, exist_ok=True)
+    exported = report.to_dict()
+    # Exclusive creation protects previous results, including concurrent writers.
+    with (path / "trajectories.jsonl").open("x", encoding="utf-8") as stream:
+        for row in exported["runs"]:
+            stream.write(json.dumps(row, sort_keys=True, allow_nan=False) + "\n")
+    for name, value in (("metrics.json", report.metrics), ("run_config.json", config)):
+        with (path / name).open("x", encoding="utf-8") as stream:
+            json.dump(value, stream, indent=2, sort_keys=True, allow_nan=False)
+            stream.write("\n")
 
 
 @dataclass(slots=True)
@@ -58,7 +97,8 @@ def evaluate_tasks(
     """Run in (difficulty, task_id) order using a fresh Agent and environment.
 
     The factory receives only task_id for fixture selection, never the full Task.
-    It must create independent backend state. All benchmark tasks are validated
+    It must create independent conversation state (stateless model weights may
+    be shared). All benchmark tasks are validated
     before any Agent executes, so bad benchmark configuration fails fast.
     """
 
@@ -116,35 +156,81 @@ def load_scripted_responses(path: Path) -> dict[str, list[str]]:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Offline Prompt Agent pipeline replay (no real model)")
+    parser = argparse.ArgumentParser(description="Prompt Agent scripted replay or Hugging Face benchmark")
+    parser.add_argument("--backend", choices=("scripted", "hf"), default="scripted")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--count-per-level", type=int, default=2)
     parser.add_argument("--max-steps", type=int, default=16)
-    parser.add_argument("--responses", type=Path, required=True, help="Per-task JSONL model-output fixtures")
+    parser.add_argument("--responses", type=Path, help="Per-task JSONL model-output fixtures (scripted only)")
+    parser.add_argument("--output-dir", type=Path, help="Save trajectories, metrics and run configuration")
+    parser.add_argument("--model", help="HF model name or local path")
+    parser.add_argument("--revision", help="Requested HF revision; pin a commit for reproducibility")
+    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--max-new-tokens", type=int, default=256)
+    parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--top-p", type=float, default=1.0)
+    parser.add_argument("--do-sample", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--local-files-only", action="store_true")
+    parser.add_argument("--allow-fallback-template", action="store_true", help="DEBUG ONLY: allow absent chat template")
     arguments = parser.parse_args(argv)
     try:
         if arguments.max_steps <= 0:
             raise ValueError("max_steps must be positive")
+        if arguments.output_dir is not None:
+            check_output_directory(arguments.output_dir)
         tasks = TaskGenerator(arguments.seed).generate_tasks(arguments.count_per_level)
-        scripts = load_scripted_responses(arguments.responses)
-        expected_ids = {task.task_id for task in tasks}
-        if set(scripts) != expected_ids:
-            raise ValueError("Replay task IDs must exactly match the generated benchmark")
-        report = evaluate_tasks(
-            tasks,
-            lambda task_id: PromptAgent(ScriptedBackend(scripts[task_id]), arguments.max_steps),
-            {environment_id_for_seed(arguments.seed): arguments.seed},
-        )
-    except (OSError, ValueError) as exc:
-        parser.error(str(exc))
-    output = {
-        "mode": "scripted_replay",
-        "configuration": {
+        configuration = {
+            "backend": arguments.backend,
             "seed": arguments.seed,
             "count_per_level": arguments.count_per_level,
             "max_steps": arguments.max_steps,
             "order": "difficulty_then_task_id",
-        },
+            "task_ids": [task.task_id for task in sorted(tasks, key=lambda item: (item.difficulty, item.task_id))],
+            **project_git_state(),
+        }
+        if arguments.backend == "scripted":
+            if arguments.responses is None or arguments.model is not None:
+                raise ValueError("scripted requires --responses and does not accept --model")
+            scripts = load_scripted_responses(arguments.responses)
+            if set(scripts) != {task.task_id for task in tasks}:
+                raise ValueError("Replay task IDs must exactly match the generated benchmark")
+            agent_factory = lambda task_id: PromptAgent(ScriptedBackend(scripts[task_id]), arguments.max_steps)
+            mode = "scripted_replay"
+        else:
+            if not arguments.model or arguments.output_dir is None or arguments.responses is not None:
+                raise ValueError("hf requires --model and --output-dir, and does not accept --responses")
+            from agent.hf_backend import HuggingFaceBackend, HuggingFaceConfig
+
+            backend_config = HuggingFaceConfig(
+                model_name_or_path=arguments.model, revision=arguments.revision, device=arguments.device,
+                max_new_tokens=arguments.max_new_tokens, temperature=arguments.temperature,
+                top_p=arguments.top_p, do_sample=arguments.do_sample,
+                local_files_only=arguments.local_files_only,
+                allow_fallback_template=arguments.allow_fallback_template,
+            )
+            backend = HuggingFaceBackend(backend_config)
+            # Seed sampling once for the whole deterministic task order. Greedy
+            # remains the default; no per-task conversational state is shared.
+            from transformers import set_seed
+
+            generation_seed = arguments.seed % (2**32)
+            set_seed(generation_seed)
+            configuration["generation_seed"] = generation_seed
+            configuration.update({"requested_backend_config": asdict(backend_config), **backend.runtime_config()})
+            mode = "hf_debug_fallback" if backend.chat_template_strategy == "debug_plaintext_fallback" else "hf_benchmark"
+            agent_factory = lambda task_id: PromptAgent(backend, arguments.max_steps)
+        configuration["mode"] = mode
+        report = evaluate_tasks(
+            tasks, agent_factory,
+            {environment_id_for_seed(arguments.seed): arguments.seed},
+        )
+        if arguments.output_dir is not None:
+            save_report(arguments.output_dir, report, configuration)
+    except (OSError, ValueError, RuntimeError) as exc:
+        parser.error(str(exc))
+    output = {
+        "mode": mode,
+        "configuration": configuration,
         **report.to_dict(),
     }
     print(json.dumps(output, indent=2, sort_keys=True, allow_nan=False))

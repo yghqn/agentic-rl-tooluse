@@ -1,0 +1,3 @@
+# Optional inference dependencies; scripted evaluation needs neither package.
+transformers==4.57.3
+torch>=2.6,<3
