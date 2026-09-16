@@ -7,7 +7,8 @@ import pytest
 
 from agent.hf_backend import HuggingFaceBackend,HuggingFaceConfig
 from grpo.policy import GRPOPolicy
-from grpo.rollouts import collect_group,derived_seed,variance_report
+from grpo.rollouts import (collect_group,collect_group_batched,collect_group_serial,
+                           derived_seed,variance_report)
 from grpo.schemas import GRPOConfig,TurnTrace,RolloutGroup,TaskCoordinate
 from grpo.tasks import build_task_manifest,coordinates,training_schedule,expression_key
 from grpo.trainer import update_groups,weights_digest
@@ -183,6 +184,46 @@ def test_generated_scores_capture_exact_raw_tokens():
     assert trace.old_logprobs == pytest.approx([torch.log_softmax(logits[i],-1)[0,t].item() for i,t in enumerate([3,2])])
 
 
+def test_batched_trace_matches_independent_rows_with_variable_prompt_lengths():
+    """A random tiny Qwen is constructed locally; no model weights are downloaded."""
+    torch = pytest.importorskip("torch")
+    transformers = pytest.importorskip("transformers")
+    torch.manual_seed(17)
+    model = transformers.Qwen2ForCausalLM(transformers.Qwen2Config(
+        vocab_size=64,hidden_size=16,intermediate_size=32,num_hidden_layers=1,
+        num_attention_heads=2,num_key_value_heads=2,max_position_embeddings=128,
+        attention_dropout=0.,eos_token_id=63,pad_token_id=0,
+    )).eval()
+
+    class Tokenizer:
+        model_max_length = 128
+        def apply_chat_template(self,messages,**kwargs):
+            return messages[-1]["content"]
+        def __call__(self,prompt,**kwargs):
+            return {"input_ids":[int(value) for value in prompt.split()]}
+        def decode(self,ids,**kwargs):
+            return " ".join(map(str,ids))
+
+    backend = HuggingFaceBackend.__new__(HuggingFaceBackend)
+    backend.config = HuggingFaceConfig("tiny",device="cpu",do_sample=True,temperature=.8,
+                                       top_p=1.,max_new_tokens=4)
+    backend._torch,backend._model,backend._tokenizer = torch,model,Tokenizer()
+    backend._template = "fixture-template"
+    backend._generation_kwargs = {"eos_token_id":[63],"pad_token_id":0}
+    rows = [[{"role":"user","content":"4 5"}],
+            [{"role":"user","content":"7 8 9 10 11"}],
+            [{"role":"user","content":"12 13 14"}]]
+    seeds = [101,202,303]
+    batched = backend.generate_batch_with_trace(rows,seeds=seeds)
+    serial = [backend.generate_batch_with_trace([row],seeds=[seed])[0]
+              for row,seed in zip(rows,seeds,strict=True)]
+    for left,right in zip(batched,serial,strict=True):
+        assert left["prompt_ids"] == right["prompt_ids"]
+        assert left["generated_ids"] == right["generated_ids"]
+        assert left["old_logprobs"] == pytest.approx(right["old_logprobs"],abs=2e-6)
+        assert left["raw_output"] == right["raw_output"]
+
+
 def test_rollouts_preserve_parse_failures_and_prompt_boundary(tmp_path):
     pytest.importorskip("torch")
     task = TaskGenerator(40000).generate_task(4)
@@ -205,6 +246,82 @@ def test_rollouts_preserve_parse_failures_and_prompt_boundary(tmp_path):
         text = json.dumps(member.turns[0].messages)
         assert all(k not in text for k in ("ground_truth","verification_spec","metadata","task_id","environment_id"))
         assert member.turns[1].messages[-1]["role"] == "user"
+
+
+def test_batched_rollout_matches_serial_for_deterministic_backend(tmp_path):
+    pytest.importorskip("torch")
+    task = TaskGenerator(40000).generate_task(1,0)
+    company,field = task.metadata["company"],task.metadata["field"]
+    answer = task.ground_truth
+    config = GRPOConfig("fixture","fixture","fixture",device="cpu",group_size=2,max_steps=3)
+
+    class DeterministicBackend:
+        _copy_messages = staticmethod(HuggingFaceBackend._copy_messages)
+        def row(self,messages):
+            if len(messages) == 2:
+                text = json.dumps({"type":"tool_call","tool":"lookup_company",
+                                   "arguments":{"company":company,"field":field}},separators=(",",":"))
+            else:
+                text = json.dumps({"type":"final","answer":answer},separators=(",",":"))
+            return asdict(TurnTrace(self._copy_messages(messages),[1,2,3],[4,2],[-.5,-.5],text,True,False))
+        def generate_with_trace(self,messages):
+            return self.row(messages)
+        def generate_batch_with_trace(self,messages_batch,**kwargs):
+            return [self.row(messages) for messages in messages_batch]
+
+    coordinate = TaskCoordinate(40000,1,0,task.task_id)
+    serial_policy = SimpleNamespace(config=config,backend=DeterministicBackend(),switch=lambda _:None)
+    batch_policy = SimpleNamespace(config=config,backend=DeterministicBackend(),switch=lambda _:None)
+    (tmp_path/"serial").mkdir()
+    (tmp_path/"batched").mkdir()
+    serial = collect_group_serial(serial_policy,coordinate,0,tmp_path/"serial")
+    batched = collect_group_batched(batch_policy,coordinate,0,tmp_path/"batched")
+    assert [asdict(member.run) for member in batched.members] == [asdict(member.run) for member in serial.members]
+    assert [[asdict(turn) for turn in member.turns] for member in batched.members] == [
+        [asdict(turn) for turn in member.turns] for member in serial.members]
+    assert [asdict(member.reward) for member in batched.members] == [asdict(member.reward) for member in serial.members]
+
+
+def test_batched_rollout_only_generates_for_still_active_members(tmp_path):
+    pytest.importorskip("torch")
+    task = TaskGenerator(40000).generate_task(1,0)
+    config = GRPOConfig("fixture","fixture","fixture",device="cpu",group_size=2,max_steps=2)
+
+    class Backend:
+        _copy_messages = staticmethod(HuggingFaceBackend._copy_messages)
+        def __init__(self): self.batch_sizes = []
+        def generate_batch_with_trace(self,messages_batch,**kwargs):
+            self.batch_sizes.append(len(messages_batch))
+            rows = []
+            for index,messages in enumerate(messages_batch):
+                final = len(self.batch_sizes) == 1 and index == 0 or len(self.batch_sizes) == 2
+                text = '{"type":"final","answer":0}' if final else "not JSON"
+                rows.append(asdict(TurnTrace(self._copy_messages(messages),[1,2],[3,2],[-.5,-.5],text,True,False)))
+            return rows
+
+    backend = Backend()
+    policy = SimpleNamespace(config=config,backend=backend,switch=lambda _:None)
+    group = collect_group_batched(policy,TaskCoordinate(40000,1,0,task.task_id),0,tmp_path)
+    assert backend.batch_sizes == [2,1]
+    assert [member.run.agent_steps for member in group.members] == [1,2]
+    assert group.members[1].run.events[0].parse_error is not None
+
+
+def test_batched_backend_failure_is_retained_for_every_active_member(tmp_path):
+    pytest.importorskip("torch")
+    task = TaskGenerator(40000).generate_task(1,0)
+    config = GRPOConfig("fixture","fixture","fixture",device="cpu",group_size=2,max_steps=2)
+    class Backend:
+        _copy_messages = staticmethod(HuggingFaceBackend._copy_messages)
+        def generate_batch_with_trace(self,*args,**kwargs):
+            raise RuntimeError("fixture failure")
+    policy = SimpleNamespace(config=config,backend=Backend(),switch=lambda _:None)
+    with pytest.raises(RuntimeError,match="abort whole batch"):
+        collect_group_batched(policy,TaskCoordinate(40000,1,0,task.task_id),0,tmp_path)
+    errors = [json.loads(line) for line in (tmp_path/"rollout_errors.jsonl").read_text().splitlines()]
+    assert len(errors) == 2
+    assert {row["member_index"] for row in errors} == {0,1}
+    assert all(row["run"]["termination_reason"] == "backend_error" for row in errors)
 
 
 @pytest.fixture(scope="module")

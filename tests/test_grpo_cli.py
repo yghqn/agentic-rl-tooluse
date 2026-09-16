@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from grpo.policy import adapter_hash
+from grpo.rollouts import ROLLOUT_ENGINE
 from grpo.schemas import GRPOConfig,TaskCoordinate
 from grpo.trainer import require_probe,dev_guards,dev_selection_key
 from scripts.train_grpo import main
@@ -22,6 +23,7 @@ def valid_probe(tmp_path):
     rows = [asdict(TaskCoordinate(seed,4,0,TaskGenerator(seed).generate_task(4).task_id)) for seed in range(40000,40020)]
     report = {"passed":True,"optimizer_updates":0,"group_count":20,"rollout_count":80,
         "mixed_reward_group_count":5,"zero_advantage_group_count":15,"alignment":{"passed":True},
+        "rollout_engine":ROLLOUT_ENGINE,
         "config":asdict(config),"initial_sft_adapter_sha256":adapter_hash(adapter),
         "coordinates":rows,"task_ids":[r["task_id"] for r in rows]}
     directory = tmp_path/"probe"
@@ -36,6 +38,14 @@ def test_probe_required_before_optimizer(valid_probe):
     config,path,report = valid_probe
     assert require_probe(path,config) == report
     with pytest.raises(ValueError,match="mandatory"): require_probe(None,config)
+
+
+def test_probe_is_bound_to_batched_rollout_engine(valid_probe):
+    config,path,report = valid_probe
+    del report["rollout_engine"]
+    path.write_text(json.dumps(report))
+    with pytest.raises(ValueError,match="variance/alignment"):
+        require_probe(path,config)
 
 
 @pytest.mark.parametrize("key,value",[("passed",False),("optimizer_updates",1),("group_count",19),

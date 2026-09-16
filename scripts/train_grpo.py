@@ -13,7 +13,7 @@ if __package__ in (None,""):
 from grpo.schemas import GRPOConfig
 from grpo.tasks import build_task_manifest, coordinates, training_schedule
 from grpo.policy import GRPOPolicy
-from grpo.rollouts import collect_group, variance_report
+from grpo.rollouts import ROLLOUT_ENGINE, collect_group, variance_report
 from grpo.rewards import REWARD_CONFIG
 from scripts.evaluate import project_git_state
 from sft.preprocessing import fingerprint
@@ -30,6 +30,7 @@ def runtime_record(policy, manifest, mode):
                 "betas":[0.9,0.999],"eps":1e-8,"weight_decay":0,"gradient_clip_norm":1.0},
             "loss_normalization":"equal group weight; sampled assistant-token mean within each group",
             "policy_iterations_per_batch":1,
+            "rollout_engine":ROLLOUT_ENGINE,
             "reward_config":REWARD_CONFIG,"generation_config":dict(policy.backend._generation_kwargs,
                 top_k=0,use_cache=True,output_scores=True,return_dict_in_generate=True),
             "transformers_version":transformers.__version__,"peft_version":peft.__version__,
@@ -115,6 +116,7 @@ def main(argv=None):
                 alignment = dict(getattr(exc,"result",{"passed":False}),error=alignment_error)
             report.update(alignment=alignment,task_ids=[c.task_id for c in picked],
                           coordinates=[asdict(c) for c in picked],
+                          rollout_engine=ROLLOUT_ENGINE,
                           config=asdict(config),identity=policy.backend.model_identity(),
                           initial_sft_adapter_sha256=policy.source_hash,
                           peak_memory_allocated_bytes=torch.cuda.max_memory_allocated() if config.device.startswith("cuda") else 0,

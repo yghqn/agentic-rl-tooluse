@@ -15,7 +15,7 @@ import random
 
 from grpo.loss import group_advantages, token_loss
 from grpo.policy import adapter_hash
-from grpo.rollouts import append_jsonl, collect_group, variance_report
+from grpo.rollouts import ROLLOUT_ENGINE, append_jsonl, collect_group, variance_report
 from grpo.schemas import TaskCoordinate, task_from_coordinate
 from grpo.tasks import coordinates, training_schedule
 from sft.preprocessing import fingerprint
@@ -31,7 +31,8 @@ def require_probe(path, config):
                 "max_new_tokens","max_steps","reward_variant","alignment_tolerance"):
         if report["config"].get(key) != getattr(config,key):
             raise ValueError(f"Probe configuration mismatch: {key}")
-    if (report.get("passed") is not True or report.get("optimizer_updates") != 0
+    if (report.get("rollout_engine") != ROLLOUT_ENGINE
+        or report.get("passed") is not True or report.get("optimizer_updates") != 0
         or report.get("group_count") != 20 or report.get("rollout_count") != 20*config.group_size
         or report.get("mixed_reward_group_count",0) <= 0
         or report.get("zero_advantage_group_count",20) >= 20

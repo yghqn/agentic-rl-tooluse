@@ -205,6 +205,13 @@ class HuggingFaceBackend:
         return converted
 
     def _prepare_inputs(self, messages: list[Message]) -> tuple[Any, int, list[Message]]:
+        prompt, converted = self._render_prompt(messages)
+        inputs = self._tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
+        input_length = inputs["input_ids"].shape[-1]
+        self._validate_context_length(input_length)
+        return inputs,input_length,converted
+
+    def _render_prompt(self, messages: list[Message]) -> tuple[str, list[Message]]:
         converted = self._copy_messages(messages)
         if self._template is not None:
             prompt = self._tokenizer.apply_chat_template(
@@ -213,8 +220,9 @@ class HuggingFaceBackend:
             )
         else:
             prompt = "\n".join(f"{m['role']}: {m['content']}" for m in converted) + "\nassistant:"
-        inputs = self._tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
-        input_length = inputs["input_ids"].shape[-1]
+        return prompt, converted
+
+    def _validate_context_length(self, input_length: int) -> None:
         limits = [
             getattr(self._model.config, "max_position_embeddings", None),
             getattr(self._tokenizer, "model_max_length", None),
@@ -222,7 +230,36 @@ class HuggingFaceBackend:
         known_limits = [limit for limit in limits if type(limit) is int and 0 < limit < 10**9]
         if known_limits and input_length + self.config.max_new_tokens > min(known_limits):
             raise ValueError("Prompt plus generation budget exceeds model context; no silent truncation")
-        return inputs,input_length,converted
+
+    def _prepare_batch_inputs(self, messages_batch: list[list[Message]]) -> tuple[Any, Any, list[list[int]], list[list[Message]]]:
+        """Render independently, then left-pad for decoder-only batched decoding."""
+        if not messages_batch:
+            raise ValueError("messages_batch must be non-empty")
+        prompt_ids: list[list[int]] = []
+        converted_batch: list[list[Message]] = []
+        for messages in messages_batch:
+            prompt, converted = self._render_prompt(messages)
+            encoded = self._tokenizer(prompt, add_special_tokens=False)
+            ids = encoded["input_ids"]
+            if ids and isinstance(ids[0], list):
+                if len(ids) != 1:
+                    raise ValueError("Tokenizer returned an unexpected batch")
+                ids = ids[0]
+            if not ids or any(type(token) is not int or token < 0 for token in ids):
+                raise ValueError("Tokenizer returned invalid or empty prompt IDs")
+            self._validate_context_length(len(ids))
+            prompt_ids.append(list(ids))
+            converted_batch.append(converted)
+        pad = self._generation_kwargs["pad_token_id"]
+        width = max(map(len, prompt_ids))
+        input_ids = self._torch.full((len(prompt_ids), width), pad, dtype=self._torch.long,
+                                     device=self.config.device)
+        attention_mask = self._torch.zeros_like(input_ids)
+        for row, ids in enumerate(prompt_ids):
+            input_ids[row, -len(ids):] = self._torch.tensor(ids, dtype=self._torch.long,
+                                                            device=self.config.device)
+            attention_mask[row, -len(ids):] = 1
+        return input_ids, attention_mask, prompt_ids, converted_batch
 
     def generate(self, messages: list[Message]) -> str:
         inputs,input_length,_ = self._prepare_inputs(messages)
@@ -267,6 +304,95 @@ class HuggingFaceBackend:
                 "ended_with_eos":ids[-1] in eos_ids,
                 "token_limit":len(ids) == self.config.max_new_tokens and ids[-1] not in eos_ids}
 
+    def generate_batch_with_trace(
+        self, messages_batch: list[list[Message]], *, seeds: list[int] | None = None,
+        generators: list[Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Sample one assistant turn for many independent trajectories.
+
+        Prompts are left-padded only for the forward pass. Returned prompt IDs
+        never contain padding, so teacher-forced policy/reference scoring keeps
+        exactly the same assistant-token boundary as single-example rollout.
+        Each row owns a generator, making its sampling stream independent of
+        other rows finishing early or having a different prompt length.
+        """
+        if not self.config.do_sample or self.config.top_p != 1 or self._template is None:
+            raise ValueError("Batched traced RL generation requires sampling, top_p=1 and model-owned template")
+        if not messages_batch or (seeds is None) == (generators is None):
+            raise ValueError("Supply exactly one seed or generator per non-empty batch row")
+        if seeds is not None and (len(messages_batch) != len(seeds)
+                                  or any(type(seed) is not int or seed < 0 for seed in seeds)):
+            raise ValueError("Batch seeds must be non-negative integers")
+        if generators is not None and len(messages_batch) != len(generators):
+            raise ValueError("Each batch row requires one generator")
+        eos = self._generation_kwargs["eos_token_id"]
+        if eos is None:
+            raise ValueError("Batched traced generation requires eos_token_id")
+        eos_ids = list(eos) if isinstance(eos, (list, tuple)) else [eos]
+        input_ids, attention_mask, prompt_ids, converted = self._prepare_batch_inputs(messages_batch)
+        torch = self._torch
+        batch_size = len(messages_batch)
+        device = torch.device(self.config.device)
+        if generators is None:
+            generators = [torch.Generator(device=device).manual_seed(seed) for seed in seeds]
+        generated: list[list[int]] = [[] for _ in range(batch_size)]
+        old_logprobs: list[list[float]] = [[] for _ in range(batch_size)]
+        finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
+        eos_tensor = torch.tensor(eos_ids, dtype=torch.long, device=device)
+        pad = self._generation_kwargs["pad_token_id"]
+        # Explicit positions are essential for left padding: real prompt tokens
+        # retain the same positions/logits as their unpadded serial counterpart.
+        position_ids = attention_mask.long().cumsum(dim=-1) - 1
+        position_ids.masked_fill_(attention_mask == 0, 0)
+        past = None
+        next_ids = input_ids
+        with torch.inference_mode():
+            for _ in range(self.config.max_new_tokens):
+                output = self._model(
+                    input_ids=next_ids,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_values=past,
+                    use_cache=True,
+                    logits_to_keep=1,
+                    return_dict=True,
+                )
+                past = output.past_key_values
+                processed = output.logits[:, -1, :].float() / self.config.temperature
+                log_probs = torch.log_softmax(processed, dim=-1)
+                probabilities = torch.softmax(processed, dim=-1)
+                active_before = ~finished
+                sampled = torch.full((batch_size,), pad, dtype=torch.long, device=device)
+                for row in active_before.nonzero(as_tuple=False).flatten().tolist():
+                    token = torch.multinomial(probabilities[row], 1, generator=generators[row]).squeeze(0)
+                    sampled[row] = token
+                    token_id = int(token.item())
+                    generated[row].append(token_id)
+                    old_logprobs[row].append(float(log_probs[row, token].item()))
+                finished |= active_before & (sampled[:, None] == eos_tensor[None, :]).any(dim=1)
+                if bool(finished.all()):
+                    break
+                attention_mask = torch.cat((attention_mask, active_before[:, None].long()), dim=1)
+                next_ids = sampled[:, None]
+                position_ids = (attention_mask.long().sum(dim=-1) - 1)[:, None]
+        traces = []
+        for row, ids in enumerate(generated):
+            if not ids or len(ids) != len(old_logprobs[row]):
+                raise ValueError("Generated IDs/scores length mismatch")
+            ended = ids[-1] in eos_ids
+            traces.append({
+                "messages": converted[row],
+                "prompt_ids": prompt_ids[row],
+                "generated_ids": ids,
+                "old_logprobs": old_logprobs[row],
+                "raw_output": self._tokenizer.decode(
+                    ids, skip_special_tokens=True, clean_up_tokenization_spaces=False,
+                ),
+                "ended_with_eos": ended,
+                "token_limit": len(ids) == self.config.max_new_tokens and not ended,
+            })
+        return traces
+
     def runtime_config(self) -> dict[str, Any]:
         """Best-effort audit information, never claimed resolved when unavailable."""
         return {
@@ -281,6 +407,7 @@ class HuggingFaceBackend:
             "dtype": str(self._model.dtype),
             "generation_config": self._generation_config.to_dict(),
             "generation_arguments": dict(self._generation_kwargs),
+            "rl_batch_generation_strategy": "same_turn_left_pad_independent_rng_v1",
             "chat_template_strategy": self.chat_template_strategy,
             "chat_template_sha256": hashlib.sha256(self._template.encode()).hexdigest() if self._template else None,
             "tool_message_strategy": "user_observation_with_tool_name",
