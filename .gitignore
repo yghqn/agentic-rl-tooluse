@@ -52,5 +52,6 @@ cache/
 # OS
 # =========================
 .DS_Store
-Thumbs.dbcloud_assets.zip
+Thumbs.db
+cloud_assets.zip
 cloud_assets/
