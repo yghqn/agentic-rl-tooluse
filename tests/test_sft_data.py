@@ -339,7 +339,9 @@ def test_saved_export_tampering_rejected(smoke, tmp_path, mutation):
         elif mutation == "order":
             rows[0], rows[1] = rows[1], rows[0]
         file_path.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
-        if mutation != "checksum":
+        if mutation == "checksum":
+            manifest["files"][name]["sha256"] = "0" * 64
+        else:
             manifest["files"][name]["sha256"] = hashlib.sha256(file_path.read_bytes()).hexdigest()
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     with pytest.raises(ValueError):
